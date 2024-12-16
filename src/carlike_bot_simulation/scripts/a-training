@@ -1,0 +1,239 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Image
+from nav_msgs.msg import Odometry
+import numpy as np
+from collections import deque
+import cv2
+from cv_bridge import CvBridge
+import random
+import time
+from std_srvs.srv import Empty
+
+class DQNAgent:
+    def __init__(self, action_space, gamma=0.99, epsilon=1.0, epsilon_min=0.1, epsilon_decay=0.995, batch_size=32, replay_buffer_size=10000):
+        self.action_space = action_space
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
+        self.batch_size = batch_size
+        self.replay_buffer = deque(maxlen=replay_buffer_size)
+
+        # Initialize the Q-network and target network
+        self.q_network = DQN(action_space)
+        self.target_network = DQN(action_space)
+        self.target_network.load_state_dict(self.q_network.state_dict())
+
+        # Optimizer
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=0.0001)
+
+    def act(self, state):
+        """Select an action using epsilon-greedy policy."""
+        if np.random.rand() <= self.epsilon:
+            return random.randrange(self.action_space)  # Random action
+        state = torch.FloatTensor(state).unsqueeze(0)  # Add batch dimension
+        q_values = self.q_network(state)
+        return torch.argmax(q_values).item()  # Action with the highest Q-value
+
+    def train(self):
+        """Train the DQN agent."""
+        if len(self.replay_buffer) < self.batch_size:
+            return
+
+        # Sample a batch of experiences
+        batch = random.sample(self.replay_buffer, self.batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+
+        states = torch.FloatTensor(states)
+        actions = torch.LongTensor(actions)
+        rewards = torch.FloatTensor(rewards)
+        next_states = torch.FloatTensor(next_states)
+        dones = torch.FloatTensor(dones)
+
+        # Compute Q-values for the current states
+        q_values = self.q_network(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+
+        # Compute the target Q-values using the target network
+        with torch.no_grad():
+            next_q_values = self.target_network(next_states).max(1)[0]
+            target_q_values = rewards + (self.gamma * next_q_values * (1 - dones))
+
+        # Compute loss (Mean Squared Error)
+        loss = nn.MSELoss()(q_values, target_q_values)
+
+        # Perform a gradient descent step
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        # Update epsilon (for epsilon-greedy exploration)
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+    def update_target_network(self):
+        """Update the target network with the weights of the Q-network."""
+        self.target_network.load_state_dict(self.q_network.state_dict())
+
+class DQN(nn.Module):
+    def __init__(self, action_space):
+        super(DQN, self).__init__()
+        self.action_space = action_space
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=4, stride=2)
+        self.fc1 = nn.Linear(32 * 9 * 9 + 3, 512)  # Flattened image + position (x, y, velocity)
+        self.fc2 = nn.Linear(512, self.action_space)
+
+    def forward(self, x):
+        image_input = x[:, :-3].view(-1, 3, 84, 84)  # The first part of the input is the image
+        position_input = x[:, -3:]  # The last 3 elements are the position and velocity
+        
+        x = torch.relu(self.conv1(image_input))
+        x = torch.relu(self.conv2(x))
+        x = x.view(x.size(0), -1)  # Flatten the convolution output
+        x = torch.relu(self.fc1(torch.cat((x, position_input), dim=1)))  # Concatenate image and position data
+        return self.fc2(x)
+
+
+# Discretized actions
+STEERING_ANGLES = [-1.0, -0.5, 0.0, 0.5, 1.0]  # Example steering values
+VELOCITY = 0.1  # Constant speed
+
+class RobotEnv(Node):
+    def __init__(self):
+        super().__init__('robot_env')
+        self.publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.camera_subscriber = self.create_subscription(Image, '/camera/image_raw', self.camera_callback, 10)
+        self.odom_subscriber = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+
+        self.bridge = CvBridge()
+        self.camera_data = None
+        self.odom_data = None
+        self.state = None
+        self.action_space = len(STEERING_ANGLES)  # Number of discrete actions (steering angles)
+        self.reward = 0
+        self.done = False
+        self.reset_simulation_client = self.create_client(Empty, '/reset_simulation')
+        self.reset_world_client = self.create_client(Empty, '/reset_world')
+
+        # Wait for Gazebo services to become available
+        while not self.reset_simulation_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info("Waiting for /reset_simulation service...")
+        while not self.reset_world_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info("Waiting for /reset_world service...")
+
+    
+    def camera_callback(self, msg):
+        self.camera_data = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+        self.state = self.get_state()
+
+    def odom_callback(self, msg):
+        self.odom_data = msg
+        self.state = self.get_state()
+
+    def get_state(self):
+        """Get the robot's state (camera image and odom data)."""
+        if self.camera_data is None or self.odom_data is None:
+            return None
+        position = self.odom_data.pose.pose.position
+        velocity = self.odom_data.twist.twist.linear.x
+        # Flatten the camera image to feed into the neural network
+        camera_image = cv2.resize(self.camera_data, (84, 84))  # Resize for the neural net
+        camera_image = np.array(camera_image).flatten()  # Flatten image
+        return np.concatenate([camera_image, np.array([position.x, position.y, velocity])])
+
+    def reset(self):
+        """Reset the environment (robot's state and position)."""
+        self.done = False
+        self.reward = 0
+        self.step_count = 0
+
+        # Reset Gazebo simulation
+        
+        # Wait for valid sensor data
+        while self.camera_data is None or self.odom_data is None:
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        self.state = self.get_state()
+        return self.state
+
+    def step(self, action):
+        """Take an action and return the next state, reward, and done flag."""
+        # Publish the action as a Twist message
+         
+        steering_angle = STEERING_ANGLES[action]
+        twist = Twist()
+        twist.linear.x = VELOCITY
+        twist.angular.z = steering_angle
+        self.publisher.publish(twist)
+
+    # Wait for the state to update
+        while self.state is None:
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        # Compute the reward based on the current distance
+        if self.odom_data is not None:
+            position = self.odom_data.pose.pose.position
+            distance_from_origin = np.sqrt(position.x**2 + position.y**2)
+            if distance_from_origin < 6:
+                self.reward = -1
+            elif distance_from_origin > 7.5:
+                self.reward = -1
+            
+            else:
+                self.reward = 0.2 
+                print(position )# Penalty for staying in the middle range
+        self.step_count+=1
+
+        # Check if the episode is done
+        if self.step_count >= 1000:
+            self.done = True
+            
+        print(position)
+        
+        return self.get_state(), self.reward, self.done
+
+
+    def render(self):
+        """Render the environment (visualize the robot and camera data)."""
+        if self.camera_data is not None:
+            cv2.imshow("Camera Feed", self.camera_data)
+            cv2.waitKey(1)
+
+
+def train():
+    rclpy.init()
+    env = RobotEnv()
+    agent = DQNAgent(action_space=5)
+
+    num_episodes = 1000
+
+    for e in range(num_episodes):
+     state = env.reset()
+     if state is None:
+                print("State initialization failed!")
+                break
+
+     done = False
+     total_reward = 0
+
+     while not done:
+                    action = agent.act(state)
+                    next_state, reward, done = env.step(action)
+                    if next_state is not None:  # Avoid appending invalid states
+                        agent.replay_buffer.append((state, action, reward, next_state, done))
+                        state = next_state
+                        agent.train()
+                    total_reward += reward
+
+     print(f"Episode {e+1}/{num_episodes}, Total Reward: {total_reward}")
+     if e % 10 == 0:
+                    agent.update_target_network()
+
+
+if __name__ == "__main__":
+    train()

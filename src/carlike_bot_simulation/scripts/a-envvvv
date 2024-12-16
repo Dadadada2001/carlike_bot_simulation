@@ -1,0 +1,99 @@
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Image
+from nav_msgs.msg import Odometry
+import torch
+import numpy as np
+from collections import deque
+import cv2
+from cv_bridge import CvBridge
+import random
+import time
+
+# Discretized actions
+STEERING_ANGLES = [-1.0, -0.5, 0.0, 0.5, 1.0]  # Example steering values
+VELOCITY = 0.05
+
+class RobotEnv(Node):
+    def __init__(self):
+        super().__init__('robot_env')
+        self.publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.camera_subscriber = self.create_subscription(Image, '/camera/image_raw', self.camera_callback, 10)
+        self.odom_subscriber = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+
+        self.bridge = CvBridge()
+        self.camera_data = None
+        self.odom_data = None
+        self.state = None
+        self.action_space = len(STEERING_ANGLES)  # Number of discrete actions (steering angles)
+        self.reward = 0
+        self.done = False
+
+    def camera_callback(self, msg):
+        self.camera_data = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+        self.state = self.get_state()
+
+    def odom_callback(self, msg):
+        self.odom_data = msg
+        self.state = self.get_state()
+
+    def get_state(self):
+        """Get the robot's state (camera image and odom data)."""
+        if self.camera_data is None or self.odom_data is None:
+            return None
+        position = self.odom_data.pose.pose.position
+        velocity = self.odom_data.twist.twist.linear.x
+        # Flatten the camera image to feed into the neural network
+        camera_image = cv2.resize(self.camera_data, (84, 84))  # Resize for the neural net
+        camera_image = np.array(camera_image).flatten()  # Flatten image
+        return np.concatenate([camera_image, np.array([position.x, position.y, velocity])])
+
+    def reset(self):
+     """Reset the environment (robot's state and position)."""
+     self.done = False
+     self.reward = 0
+    
+    # Wait for valid camera and odom data
+     while self.camera_data is None or self.odom_data is None:
+        rclpy.spin_once(self, timeout_sec=0.1)
+    
+     self.state = self.get_state()
+     return self.state
+
+
+    def step(self, action):
+        """Take an action and return the next state, reward, and done flag."""
+        # Create the Twist message based on the selected action
+        steering_angle = STEERING_ANGLES[action]
+        twist = Twist()
+        twist.linear.x = VELOCITY
+        twist.angular.z = steering_angle
+        self.publisher.publish(twist)
+        
+        # Wait for a short period to simulate robot movement
+        time.sleep(0.1)
+        
+        # Get the current distance from the origin
+        if self.odom_data is not None:
+            position = self.odom_data.pose.pose.position
+            distance_from_origin = np.sqrt(position.x**2 + position.y**2)
+            if distance_from_origin < 6:
+                self.reward = 1
+            elif distance_from_origin > 7.5:
+                self.reward = -1
+            else:
+                self.reward = -0.1  # Penalty for staying in the middle range
+        
+        # Check if the episode is done
+        if self.reward == -1:
+            self.done = True
+        
+        return self.state, self.reward, self.done
+
+    def render(self):
+        """Render the environment (visualize the robot and camera data)."""
+        if self.camera_data is not None:
+            cv2.imshow("Camera Feed", self.camera_data)
+            cv2.waitKey(1)
+
